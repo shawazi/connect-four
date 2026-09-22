@@ -34,16 +34,53 @@ Put it behind TLS if you do; see below.
 ## Tests
 
 ```bash
-npm test                  # rules engine + input sanitising (no server needed)
-npm start &               # then, against the running server:
-node test/e2e.test.js     # full game over WebSockets + security probes
+npm test          # rules engine, input sanitising, source hygiene
+npm run test:e2e  # full game over WebSockets + security probes
+npm run audit     # adversarial harness (see below)
+npm run test:all  # all three
 ```
+
+`test:e2e` and `audit` each spawn their own throwaway server on an ephemeral
+port bound to `127.0.0.1`. Never point them at a running instance — an earlier
+version did, and its fixtures ended up in the live lobby chat.
 
 The e2e suite plays a complete game between two real clients and then attacks
 the server: out-of-turn moves, out-of-range and non-integer columns, forged
 seat tokens, spectator moves, malformed JSON, prototype pollution, path
 traversal in room codes, message floods, oversized frames, and cross-site
 WebSocket hijacking.
+
+### The audit harness
+
+`test/audit.js` is not a unit test. It runs attacks against a disposable server
+and reports **measurements**, so a regression shows up as a number getting
+worse rather than as an opinion. It currently covers response headers,
+forwarding-header spoofing from an untrusted peer (and the inverse — that a
+trusted proxy can still set a client identity), lobby broadcast amplification,
+room-table exhaustion, invite-code brute force, chat fan-out egress per
+address, and Slowloris.
+
+It has found real bugs. The findings and their fixes are in the git history;
+the ones worth knowing about:
+
+- **`connect-src` listed the bare `ws:`/`wss:` schemes**, which match any host.
+  The one CSP directive meant to contain an XSS was the one that would have let
+  it exfiltrate anywhere.
+- **`TRUST_PROXY=1` made `X-Forwarded-For` authoritative unconditionally**, so
+  any LAN client could mint a fresh identity per connection and walk through the
+  per-IP cap — 30 connections against a cap of 20. Forwarding headers are now
+  honoured only from a trusted TCP peer.
+- **Lobby list updates fanned out on every triggering event**, which a client
+  controls: 20 small messages became 23,500 bytes at 25 idle victims, x37
+  amplification. Now coalesced — x1.8.
+- **The chat limiter was per connection**, so the per-IP connection cap
+  _multiplied_ one client's allowance instead of bounding it: 20 sockets pushed
+  930 KB at 25 members in 1.5s, which projects to 23.8 MB/s of egress on
+  command. Now two-tier, and the lobby has a member cap.
+- **`headersTimeout` alone does nothing.** Node only sweeps for expired
+  half-open requests every `connectionsCheckingInterval`, which defaults to 30s
+  — longer than any timeout worth setting. It must be passed as a
+  `createServer` option; set as a property afterwards it is dead config.
 
 ## Security model
 
@@ -64,11 +101,15 @@ opponent, or move after the game ends.
 | Path traversal                 | Static files served from a fixed route allowlist read into memory at boot — no filesystem path is ever built from a request                                      |
 | Clickjacking                   | `X-Frame-Options: DENY` + `frame-ancestors 'none'`                                                                                                               |
 | Message flooding               | Per-connection token bucket (5/s sustained, burst 20)                                                                                                            |
-| Memory exhaustion              | 4 KB frame cap, caps on rooms/connections/connections-per-IP/spectators, idle rooms reaped after 30 min                                                          |
+| Chat flooding / fan-out abuse  | Two tiers: per connection (1/s, burst 5) _and_ per address (10/s, burst 30), plus a 150-member lobby cap that bounds the broadcast multiplier                    |
+| Memory exhaustion              | 4 KB frame cap, caps on rooms/connections/connections-per-IP/rooms-per-IP/spectators, idle rooms reaped after 30 min                                             |
 | Compression amplification      | `permessage-deflate` disabled                                                                                                                                    |
+| Lobby broadcast storms         | Game-list updates coalesced to one flush per 250 ms, and suppressed entirely when the payload is unchanged                                                       |
+| Invite-code guessing           | Socket is cut after 12 wrong codes; a successful join clears the count                                                                                           |
+| Slowloris / half-open requests | 8s headers timeout, 15s request timeout, swept every 2s, plus a socket ceiling on the listener                                                                   |
 | Dead connections               | 30s ping/pong heartbeat, unresponsive sockets terminated                                                                                                         |
 | Crash from bad input           | Every handler is wrapped; parse failures answer with an error frame instead of throwing                                                                          |
-| Header spoofing                | `X-Forwarded-For` is only honoured when `TRUST_PROXY=1`                                                                                                          |
+| Header spoofing                | `X-Forwarded-For` / `CF-Connecting-IP` / `X-Forwarded-Proto` are honoured only when `TRUST_PROXY=1` **and** the TCP peer is loopback or in `TRUSTED_PROXIES`     |
 
 Dependencies: one (`ws`). No database, no user accounts, no cookies, no
 telemetry, nothing persisted to disk.
@@ -122,13 +163,16 @@ HTTPS the page automatically uses `wss:`.
 ## Layout
 
 ```
-game.js              rules engine — pure, no I/O
-server.js            HTTP + WebSocket, rooms, seats, limits
-public/index.html    markup
-public/styles.css    styling
-public/app.js        renderer + input forwarding
-test/game.test.js    unit tests
-test/e2e.test.js     two-client game + security probes
+game.js                rules engine — pure, no I/O
+server.js              HTTP + WebSocket, rooms, seats, limits
+public/index.html      markup
+public/styles.css      styling
+public/app.js          renderer + input forwarding
+test/game.test.js      unit tests
+test/hygiene.test.js   source guards (control bytes, innerHTML)
+test/e2e.test.js       two-client game + security probes
+test/run-e2e.js        spawns a throwaway server for the e2e suite
+test/audit.js          adversarial harness, reports measurements
 ```
 
 ## Licence

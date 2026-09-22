@@ -40,13 +40,41 @@ const LIMITS = {
   // without bound and a late joiner gets a bounded backlog.
   maxChatHistory: 50,
   maxLobbyChatHistory: 60,
+  // Every lobby chat message is copied to every member, so the member count is
+  // the multiplier on one client's outbound bandwidth (audit A8). 1000 sockets
+  // in one chat channel is not a product requirement, it is just the connection
+  // cap leaking into the fan-out.
+  maxLobbyMembers: 150,
+  // Wrong room codes a single socket may burn before it is cut (audit A9).
+  // Enough for a human fat-fingering an invite, far too few to search 32^6.
+  maxFailedJoins: 12,
+  // HTTP-level timeouts (audit A10). Node defaults are 60s/300s, which lets a
+  // trickle of half-open requests sit on the listener for free.
+  headersTimeoutMs: 8 * 1000,
+  requestTimeoutMs: 15 * 1000,
+  keepAliveTimeoutMs: 5 * 1000,
+  // How often the two timeouts above are actually swept for. Node's default is
+  // 30s, which is longer than the timeouts themselves.
+  connectionsCheckIntervalMs: 2 * 1000,
   // The lobby list is public, so it is capped to bound both the payload size
   // and how much a scraper learns from one request.
   maxListedGames: 60,
+  // Lobby list updates are coalesced into one flush per interval so a client
+  // cannot drive the broadcast rate (audit A3).
+  listFlushMs: 250,
+  // Concurrent rooms one client address may hold open (audit A4).
+  maxRoomsPerIp: 5,
   // Chat is throttled harder than moves: sustained 1/s, burst of 5. The generic
   // limiter alone would still allow 5 messages a second of spam.
   chatBurst: 5,
   chatRefillPerSec: 1,
+  // Second tier, per ADDRESS (audit A8). The per-connection bucket keeps one
+  // socket polite; it cannot bound a client, because a client may hold
+  // maxConnectionsPerIp sockets and so multiply its own allowance. Set well
+  // above what a household behind one NAT would ever produce, and far below
+  // what 20 sockets could.
+  chatIpBurst: 30,
+  chatIpRefillPerSec: 10,
 };
 
 // ---------------------------------------------------------------------------
@@ -75,16 +103,22 @@ for (const [, route] of STATIC_ROUTES) {
 
 const SECURITY_HEADERS = {
   // No inline script, no external anything. 'self' covers app.js/styles.css.
-  // connect-src includes ws:/wss: so the page can open its own socket.
+  //
+  // connect-src is 'self' ONLY. It previously also listed the bare `ws:` and
+  // `wss:` schemes (audit A1), which match ANY host — so the one directive
+  // meant to contain an XSS was the one that would have let it exfiltrate
+  // anywhere. Under CSP3 'self' covers a same-origin WebSocket, which is the
+  // only socket this page opens.
   "Content-Security-Policy": [
     "default-src 'none'",
     "script-src 'self'",
     "style-src 'self'",
     "img-src 'self' data:",
-    "connect-src 'self' ws: wss:",
+    "connect-src 'self'",
     "base-uri 'none'",
     "form-action 'none'",
     "frame-ancestors 'none'",
+    "object-src 'none'",
   ].join("; "),
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
@@ -95,54 +129,88 @@ const SECURITY_HEADERS = {
   "Cross-Origin-Resource-Policy": "same-origin",
 };
 
-const server = http.createServer((req, res) => {
-  for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
-    res.setHeader(key, value);
-  }
+const server = http.createServer(
+  {
+    // Audit A10. These have to be constructor options, not properties set
+    // afterwards — specifically connectionsCheckingInterval, which is the
+    // sweep that actually enforces the other two. Its default is 30s, so a
+    // tight headersTimeout set on its own is dead config: the timeout is
+    // correct and simply never gets looked at in time.
+    headersTimeout: LIMITS.headersTimeoutMs,
+    requestTimeout: LIMITS.requestTimeoutMs,
+    keepAliveTimeout: LIMITS.keepAliveTimeoutMs,
+    connectionsCheckingInterval: LIMITS.connectionsCheckIntervalMs,
+  },
+  (req, res) => {
+    for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
+      res.setHeader(key, value);
+    }
 
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    res.writeHead(405, { Allow: "GET, HEAD", "Content-Type": "text/plain" });
-    res.end("Method Not Allowed");
-    return;
-  }
+    // HSTS only where it means something. Sent unconditionally it would be a
+    // no-op on the LAN (browsers ignore it over plain HTTP) but would pin the
+    // host to HTTPS for anyone who ever reached it by name over TLS. And the
+    // header that says "this was HTTPS" is only believable from the proxy that
+    // terminated the TLS, so it is gated on the same trust check as the client
+    // address — a LAN client must not be able to pin its own browser.
+    if (
+      req.headers["x-forwarded-proto"] === "https" &&
+      peerIsTrustedProxy(req)
+    ) {
+      res.setHeader(
+        "Strict-Transport-Security",
+        "max-age=31536000; includeSubDomains",
+      );
+    }
 
-  // Strip the query string; only the exact pathname is matched against the
-  // allowlist, so "../" and friends can never reach the filesystem.
-  let pathname;
-  try {
-    pathname = new URL(req.url, "http://localhost").pathname;
-  } catch {
-    res.writeHead(400, { "Content-Type": "text/plain" });
-    res.end("Bad Request");
-    return;
-  }
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.writeHead(405, { Allow: "GET, HEAD", "Content-Type": "text/plain" });
+      res.end("Method Not Allowed");
+      return;
+    }
 
-  if (pathname === "/healthz") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        ok: true,
-        rooms: rooms.size,
-        connections: totalConnections,
-      }),
-    );
-    return;
-  }
+    // Strip the query string; only the exact pathname is matched against the
+    // allowlist, so "../" and friends can never reach the filesystem.
+    let pathname;
+    try {
+      pathname = new URL(req.url, "http://localhost").pathname;
+    } catch {
+      res.writeHead(400, { "Content-Type": "text/plain" });
+      res.end("Bad Request");
+      return;
+    }
 
-  const route = STATIC_ROUTES.get(pathname);
-  if (!route) {
-    res.writeHead(404, { "Content-Type": "text/plain" });
-    res.end("Not Found");
-    return;
-  }
+    if (pathname === "/healthz") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          rooms: rooms.size,
+          connections: totalConnections,
+        }),
+      );
+      return;
+    }
 
-  const body = STATIC_CACHE.get(route.file);
-  res.writeHead(200, {
-    "Content-Type": route.type,
-    "Content-Length": body.length,
-  });
-  res.end(req.method === "HEAD" ? undefined : body);
-});
+    const route = STATIC_ROUTES.get(pathname);
+    if (!route) {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("Not Found");
+      return;
+    }
+
+    const body = STATIC_CACHE.get(route.file);
+    res.writeHead(200, {
+      "Content-Type": route.type,
+      "Content-Length": body.length,
+    });
+    res.end(req.method === "HEAD" ? undefined : body);
+  },
+);
+
+// A hard ceiling on sockets, including those that never finish a handshake.
+// Sits above maxConnections so WebSocket clients are turned away by the
+// application (with a status) before the listener starts dropping them blind.
+server.maxConnections = LIMITS.maxConnections + 200;
 
 // ---------------------------------------------------------------------------
 // Room + player state
@@ -152,6 +220,8 @@ const server = http.createServer((req, res) => {
 const rooms = new Map();
 /** @type {Map<string, number>} */
 const connectionsPerIp = new Map();
+/** @type {Map<string, number>} concurrent rooms held per client address (audit A4) */
+const roomsPerIp = new Map();
 let totalConnections = 0;
 
 /**
@@ -217,12 +287,26 @@ function createRoom() {
   return room;
 }
 
+/**
+ * Single exit point for a room, so the per-IP room budget is always released.
+ * Two call sites used to `rooms.delete()` directly; a counter that is only
+ * decremented on one of them leaks until creation is permanently blocked.
+ */
+function destroyRoom(room) {
+  if (!rooms.delete(room.code)) return; // already gone
+  if (room.creatorIp) {
+    const n = (roomsPerIp.get(room.creatorIp) || 1) - 1;
+    if (n <= 0) roomsPerIp.delete(room.creatorIp);
+    else roomsPerIp.set(room.creatorIp, n);
+  }
+}
+
 function deleteRoomIfEmpty(room) {
   const seated = [...room.seats.values()].filter(
     (p) => p.ws && p.ws.readyState === 1,
   );
   if (seated.length === 0 && room.spectators.size === 0) {
-    rooms.delete(room.code);
+    destroyRoom(room);
   }
 }
 
@@ -368,16 +452,69 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
+/** IPv6-mapped IPv4 (::ffff:127.0.0.1) has to be unwrapped before comparing. */
+function normalizeIp(ip) {
+  if (typeof ip !== "string") return "unknown";
+  return ip.startsWith("::ffff:") ? ip.slice(7) : ip;
+}
+
+function isLoopback(ip) {
+  const n = normalizeIp(ip);
+  return n === "127.0.0.1" || n === "::1" || n.startsWith("127.");
+}
+
+/**
+ * The client's address for rate-limiting purposes.
+ *
+ * `TRUST_PROXY=1` alone is not enough to believe `X-Forwarded-For`: the header
+ * is attacker-controlled, so trusting it unconditionally lets anyone mint a
+ * fresh identity per connection and walk straight through the per-IP cap.
+ * Audit finding A2 demonstrated exactly that — 30 connections from one host
+ * against a cap of 20.
+ *
+ * So the header is honoured only when the TCP peer is itself trusted. The
+ * tunnel connects over loopback, which is the only peer trusted by default;
+ * TRUSTED_PROXIES can name additional ones for a real reverse proxy. A client
+ * reaching the port directly over the LAN is not a trusted peer, so its
+ * spoofed header is ignored and its real address is used.
+ */
+const TRUSTED_PROXIES = new Set(
+  (process.env.TRUSTED_PROXIES || "")
+    .split(",")
+    .map((s) => normalizeIp(s.trim()))
+    .filter(Boolean),
+);
+
+/**
+ * Whether the TCP peer is allowed to speak for someone else — i.e. to set any
+ * X-Forwarded-* header. This is the single place that decision is made, so the
+ * client address and the "was this HTTPS" claim can never disagree about who
+ * is trusted.
+ */
+function peerIsTrustedProxy(req) {
+  if (process.env.TRUST_PROXY !== "1") return false;
+  const peer = req.socket.remoteAddress || "unknown";
+  return isLoopback(peer) || TRUSTED_PROXIES.has(normalizeIp(peer));
+}
+
 function clientIp(req) {
-  // Only trust X-Forwarded-For when explicitly told we are behind a proxy,
-  // otherwise any client could spoof the header to evade per-IP limits.
-  if (process.env.TRUST_PROXY === "1") {
+  const peer = req.socket.remoteAddress || "unknown";
+
+  if (peerIsTrustedProxy(req)) {
+    // Cloudflare's own header first: unlike XFF it is overwritten at the
+    // edge rather than appended to, so a client-supplied value cannot survive.
+    const cf = req.headers["cf-connecting-ip"];
+    if (typeof cf === "string" && cf.length > 0 && cf.length <= 64) {
+      return normalizeIp(cf.trim());
+    }
     const xff = req.headers["x-forwarded-for"];
     if (typeof xff === "string" && xff.length > 0) {
-      return xff.split(",")[0].trim();
+      // Left-most entry is the original client, per the proxy convention.
+      return normalizeIp(xff.split(",")[0].trim());
     }
   }
-  return req.socket.remoteAddress || "unknown";
+
+  return normalizeIp(peer);
 }
 
 function send(ws, type, payload) {
@@ -441,9 +578,11 @@ wss.on("connection", (ws, req) => {
     tokens: LIMITS.rateBurst,
     lastRefill: Date.now(),
     // Chat gets its own bucket so spamming the log cannot be hidden inside the
-    // generic message allowance.
+    // generic message allowance. Paired with a per-address bucket (audit A8).
     chatTokens: LIMITS.chatBurst,
     chatLastRefill: Date.now(),
+    // Wrong invite codes tried on this socket (audit A9).
+    failedJoins: 0,
   };
   ws.ctx = ctx;
   ws.isAlive = true;
@@ -543,8 +682,25 @@ function consumeRateToken(ctx) {
   return true;
 }
 
+/**
+ * Chat allowance, keyed by client ADDRESS rather than by socket.
+ *
+ * Audit finding A8: as a per-connection bucket this was multiplied by the
+ * per-IP connection cap. One client holding its 20 permitted sockets pushed
+ * 930 KB at 25 lobby members in 1.5s — projected to a full lobby, 23.8 MB/s of
+ * egress on command. A per-connection limit cannot bound a fan-out, because the
+ * thing being limited is the client, and a client is an address, not a socket.
+ *
+ * @type {Map<string, {tokens:number,last:number}>}
+ */
+const chatBuckets = new Map();
+
 function consumeChatToken(ctx) {
   const now = Date.now();
+
+  // Tier 1, per connection. Checked first deliberately: a message the socket
+  // limiter already refused must not also drain the address budget, or a single
+  // rude socket would throttle everyone else behind the same NAT.
   const elapsedSec = (now - ctx.chatLastRefill) / 1000;
   ctx.chatLastRefill = now;
   ctx.chatTokens = Math.min(
@@ -552,7 +708,23 @@ function consumeChatToken(ctx) {
     ctx.chatTokens + elapsedSec * LIMITS.chatRefillPerSec,
   );
   if (ctx.chatTokens < 1) return false;
+
+  // Tier 2, per address.
+  let bucket = chatBuckets.get(ctx.ip);
+  if (!bucket) {
+    bucket = { tokens: LIMITS.chatIpBurst, last: now };
+    chatBuckets.set(ctx.ip, bucket);
+  }
+  const ipElapsed = (now - bucket.last) / 1000;
+  bucket.last = now;
+  bucket.tokens = Math.min(
+    LIMITS.chatIpBurst,
+    bucket.tokens + ipElapsed * LIMITS.chatIpRefillPerSec,
+  );
+  if (bucket.tokens < 1) return false;
+
   ctx.chatTokens -= 1;
+  bucket.tokens -= 1;
   return true;
 }
 
@@ -588,9 +760,23 @@ function handleCreate(ws, ctx, msg) {
   if (ctx.room)
     return fail(ws, "already_in_room", "You are already in a room.");
 
+  // Audit A4: without this one address could create and hold rooms until the
+  // global table was full, denying room creation to everyone else. Holding the
+  // socket open keeps each room alive, so the idle reaper never collects them.
+  if ((roomsPerIp.get(ctx.ip) || 0) >= LIMITS.maxRoomsPerIp) {
+    return fail(
+      ws,
+      "too_many_rooms",
+      "You already have several games open. Finish or leave one first.",
+    );
+  }
+
   const room = createRoom();
   if (!room)
     return fail(ws, "server_busy", "Too many active rooms. Try again shortly.");
+
+  room.creatorIp = ctx.ip;
+  roomsPerIp.set(ctx.ip, (roomsPerIp.get(ctx.ip) || 0) + 1);
 
   const name = sanitizeName(msg.name, "Red");
   const token = crypto.randomBytes(32).toString("base64url");
@@ -619,6 +805,29 @@ function handleCreate(ws, ctx, msg) {
   broadcastGameList();
 }
 
+/**
+ * Answers a miss, and cuts the socket once a client has burned through its
+ * allowance of them.
+ *
+ * Audit finding A9: the generic 5/s limiter slowed code guessing but never
+ * stopped it, so a socket could sit there grinding the 32^6 space for as long
+ * as it liked. Throttling changes how long an attack takes; disconnecting
+ * changes whether it can be sustained at all.
+ */
+function failedJoin(ws, ctx, code, message) {
+  ctx.failedJoins += 1;
+  if (ctx.failedJoins >= LIMITS.maxFailedJoins) {
+    fail(ws, "too_many_attempts", "Too many invalid invite codes.");
+    try {
+      ws.close(4002, "too many invalid codes");
+    } catch {
+      /* already closing */
+    }
+    return;
+  }
+  return fail(ws, code, message);
+}
+
 function handleJoin(ws, ctx, msg) {
   if (ctx.room)
     return fail(ws, "already_in_room", "You are already in a room.");
@@ -627,8 +836,12 @@ function handleJoin(ws, ctx, msg) {
   if (!code) return fail(ws, "bad_code", "That invite code is not valid.");
 
   const room = rooms.get(code);
-  if (!room) return fail(ws, "no_such_room", "No room with that code.");
+  if (!room)
+    return failedJoin(ws, ctx, "no_such_room", "No room with that code.");
 
+  // A correct code clears the strike count: a player who mistyped twice and
+  // then got in is not a guesser.
+  ctx.failedJoins = 0;
   room.lastActivity = Date.now();
 
   // 1. Reconnect: a matching token reclaims the original seat.
@@ -801,16 +1014,47 @@ function sendGameList(ws) {
   });
 }
 
-function broadcastGameList() {
-  if (lobby.members.size === 0) return;
+// Coalescing state for the lobby fan-out.
+let listFlushTimer = null;
+let lastListPayload = null;
+
+/**
+ * Pushes the game list to the lobby, at most once per LIMITS.listFlushMs and
+ * only when the contents actually changed.
+ *
+ * Audit finding A3: this used to send immediately on every triggering event.
+ * Because a client can trigger it at will (lobby_join, create, join, leave),
+ * 20 small messages turned into 23,500 bytes delivered to 25 idle victims —
+ * x37 amplification — each round also rebuilding the list in O(rooms). The
+ * attacker set the fan-out rate. Now the server does: bursts collapse into a
+ * single flush, and a no-op change sends nothing at all.
+ */
+function flushGameList() {
+  listFlushTimer = null;
+  if (lobby.members.size === 0) {
+    lastListPayload = null;
+    return;
+  }
+
   const message = JSON.stringify({
     type: "game_list",
     games: publicGames(),
     lobbyCount: lobby.members.size,
   });
+
+  // Identical to what everyone already has: nothing to say.
+  if (message === lastListPayload) return;
+  lastListPayload = message;
+
   for (const ws of lobby.members) {
     if (ws.readyState === 1) ws.send(message);
   }
+}
+
+function broadcastGameList() {
+  if (listFlushTimer) return; // a flush is already pending
+  listFlushTimer = setTimeout(flushGameList, LIMITS.listFlushMs);
+  if (listFlushTimer.unref) listFlushTimer.unref();
 }
 
 function leaveLobby(ws, ctx) {
@@ -821,6 +1065,18 @@ function leaveLobby(ws, ctx) {
 
 function handleLobbyJoin(ws, ctx, msg) {
   if (ctx.room) return fail(ws, "already_in_room", "Leave your game first.");
+
+  // Audit A8: the member count is the multiplier on every chat message, so it
+  // has to be bounded independently of the connection cap. Re-joining while
+  // already a member must not be refused, or a reconnect could lock a player
+  // out of a lobby they were already in.
+  if (!ctx.inLobby && lobby.members.size >= LIMITS.maxLobbyMembers) {
+    return fail(
+      ws,
+      "lobby_full",
+      "The lobby is full right now. Join a game with an invite code.",
+    );
+  }
 
   ctx.name = sanitizeName(msg.name, "Guest");
   lobby.members.add(ws);
@@ -952,13 +1208,23 @@ const heartbeat = setInterval(() => {
 heartbeat.unref();
 
 const reaper = setInterval(() => {
-  const cutoff = Date.now() - LIMITS.roomIdleMs;
-  for (const [code, room] of rooms) {
+  const now = Date.now();
+  const cutoff = now - LIMITS.roomIdleMs;
+  for (const room of rooms.values()) {
     const live =
       [...room.seats.values()].some((p) => p.ws && p.ws.readyState === 1) ||
       room.spectators.size > 0;
     if (!live && room.lastActivity < cutoff) {
-      rooms.delete(code);
+      destroyRoom(room);
+    }
+  }
+
+  // Prune chat buckets for addresses that are gone. Only once they have been
+  // idle well past a full refill, so dropping the entry can never hand anyone
+  // an allowance they had not already earned by waiting.
+  for (const [ip, bucket] of chatBuckets) {
+    if (!connectionsPerIp.has(ip) && now - bucket.last > 60 * 1000) {
+      chatBuckets.delete(ip);
     }
   }
 }, 60 * 1000);

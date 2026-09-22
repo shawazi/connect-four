@@ -7,8 +7,10 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/game.test.js",
-    "test:e2e": "node test/run-e2e.js"
+    "test": "node test/game.test.js && node test/hygiene.test.js",
+    "test:e2e": "node test/run-e2e.js",
+    "audit": "node test/audit.js",
+    "test:all": "npm test && npm run test:e2e && npm run audit"
   },
   "engines": {
     "node": ">=18"
