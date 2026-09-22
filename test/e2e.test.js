@@ -655,6 +655,56 @@ async function main() {
   }
   check("lobby chat is rate limited too", sharedLimited);
 
+  // Regression: a client that reconnects while sitting in the lobby must be
+  // put back in the lobby. Previously the socket came back but no lobby_join
+  // was sent, so the server never re-added it: the game list froze and
+  // clicking a since-deleted entry reported "no game found".
+  const R1 = client();
+  await R1.open();
+  await R1.wait(isType("hello"));
+  R1.send({ type: "lobby_join", name: "Reconnector" });
+  await R1.wait(isType("lobby_joined"));
+  await R1.wait(isType("game_list"));
+  R1.close();
+
+  // The new socket stands in for the client's automatic reconnect.
+  const R2 = client();
+  await R2.open();
+  await R2.wait(isType("hello"));
+  R2.send({ type: "lobby_join", name: "Reconnector" });
+  await R2.wait(isType("lobby_joined"));
+
+  // Prove it is genuinely back in the lobby: a new public game must reach it.
+  const freshHost = client();
+  await freshHost.open();
+  await freshHost.wait(isType("hello"));
+  R2.drain();
+  freshHost.send({ type: "create", name: "FreshHost", visibility: "public" });
+  const freshJoined = await freshHost.wait(isType("joined"));
+  const gotUpdate = await R2.wait(
+    (m) =>
+      m.type === "game_list" &&
+      m.games.some((g) => g.code === freshJoined.code),
+    5000,
+  );
+  check("a reconnected lobby client still receives list updates", !!gotUpdate);
+
+  // And that a genuinely dead code is reported as such (what the user saw).
+  R2.drain();
+  R2.send({ type: "join", code: "ZZZZZZ", name: "Reconnector" });
+  check(
+    "joining a vanished game reports no_such_room",
+    (await R2.wait(isType("error"))).code === "no_such_room",
+  );
+
+  for (const cl of [R1, R2, freshHost]) {
+    try {
+      cl.close();
+    } catch {
+      /* ignore */
+    }
+  }
+
   for (const cl of [L1, L2, priv, pub, filler, nonMember, shared]) {
     try {
       cl.close();

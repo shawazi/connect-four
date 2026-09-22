@@ -157,6 +157,13 @@
               token: myToken,
               name: myName(),
             });
+          } else {
+            // Sitting in the lobby: rejoin it. Without this the socket comes
+            // back but the server never re-adds us to the lobby, so the game
+            // list freezes at its pre-disconnect contents (and clicking Join
+            // on a since-deleted room reports "no game found") and lobby chat
+            // silently stops arriving.
+            sendRaw({ type: "lobby_join", name: myName() });
           }
         });
       }, reconnectDelay);
@@ -264,6 +271,11 @@
       el.createBtn.disabled = false;
       el.createPrivateBtn.disabled = false;
       el.joinBtn.disabled = false;
+      // The listed game is gone. Re-announce to get a fresh list rather than
+      // leaving a dead entry on screen for the user to click again.
+      if (msg.code === "no_such_room") {
+        sendRaw({ type: "lobby_join", name: myName() });
+      }
     } else if (!quiet.includes(msg.code)) {
       el.status.textContent = friendly(msg);
     }
