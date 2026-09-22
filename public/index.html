@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Connect Four</title>
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='13' fill='%23ef4444'/></svg>">
+</head>
+<body>
+<main class="shell">
+
+  <header class="topbar">
+    <h1 class="logo"><span class="dot dot-red"></span><span class="dot dot-yellow"></span>Connect Four</h1>
+    <div class="conn" id="conn" data-state="connecting">connecting…</div>
+  </header>
+
+  <!-- Lobby -->
+  <section class="panel" id="lobby">
+    <label class="field">
+      <span>Your name</span>
+      <input id="name-input" type="text" maxlength="20" autocomplete="off"
+             spellcheck="false" placeholder="Player">
+    </label>
+
+    <button class="btn btn-primary" id="create-btn">Create a game</button>
+
+    <div class="divider"><span>or</span></div>
+
+    <form class="join-row" id="join-form">
+      <input id="code-input" type="text" maxlength="6" autocomplete="off"
+             spellcheck="false" autocapitalize="characters" placeholder="INVITE CODE">
+      <button class="btn" id="join-btn" type="submit">Join</button>
+    </form>
+
+    <p class="lobby-error" id="lobby-error" role="alert"></p>
+  </section>
+
+  <!-- Game -->
+  <section class="panel game hidden" id="game">
+
+    <div class="invite" id="invite">
+      <div class="invite-head">
+        <span class="invite-label">Invite a friend</span>
+        <span class="code" id="room-code">------</span>
+      </div>
+      <div class="invite-actions">
+        <input id="invite-link" type="text" readonly aria-label="Invite link">
+        <button class="btn btn-small" id="copy-btn">Copy</button>
+      </div>
+    </div>
+
+    <div class="scoreboard">
+      <div class="player" id="p-red" data-seat="red">
+        <span class="disc disc-red"></span>
+        <span class="pname" id="name-red">Waiting…</span>
+        <span class="score" id="score-red">0</span>
+      </div>
+      <div class="draws"><span id="score-draw">0</span><small>draws</small></div>
+      <div class="player" id="p-yellow" data-seat="yellow">
+        <span class="disc disc-yellow"></span>
+        <span class="pname" id="name-yellow">Waiting…</span>
+        <span class="score" id="score-yellow">0</span>
+      </div>
+    </div>
+
+    <p class="status" id="status" role="status" aria-live="polite">Waiting for an opponent…</p>
+
+    <div class="board-wrap">
+      <div class="board" id="board" role="grid" aria-label="Connect Four board"></div>
+    </div>
+
+    <div class="controls">
+      <button class="btn btn-primary hidden" id="rematch-btn">Rematch</button>
+      <button class="btn btn-ghost" id="leave-btn">Leave</button>
+    </div>
+
+    <p class="you" id="you"></p>
+  </section>
+
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
