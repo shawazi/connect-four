@@ -1,32 +1,25 @@
-'use strict';
+"use strict";
 
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const { WebSocketServer } = require('ws');
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const { WebSocketServer } = require("ws");
 
-const {
-  COLS,
-  ROWS,
-  RED,
-  YELLOW,
-  createGame,
-  applyMove,
-} = require('./game');
+const { COLS, ROWS, RED, YELLOW, createGame, applyMove } = require("./game");
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
 const PORT = Number(process.env.PORT) || 3000;
-const HOST = process.env.HOST || '0.0.0.0';
+const HOST = process.env.HOST || "0.0.0.0";
 
 // Comma-separated extra origins, e.g. "https://c4.example.com".
 // Same-host origins are always allowed; this is for when you put the app
 // behind a proxy on a different hostname.
-const EXTRA_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
+const EXTRA_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
@@ -42,33 +35,44 @@ const LIMITS = {
   // Token bucket: sustained 5 msg/s, burst of 20.
   rateBurst: 20,
   rateRefillPerSec: 5,
+  maxChatLength: 300,
+  // Only the last N messages are retained, so a long-running room cannot grow
+  // without bound and a late joiner gets a bounded backlog.
+  maxChatHistory: 50,
+  // Chat is throttled harder than moves: sustained 1/s, burst of 5. The generic
+  // limiter alone would still allow 5 messages a second of spam.
+  chatBurst: 5,
+  chatRefillPerSec: 1,
 };
 
 // ---------------------------------------------------------------------------
 // Static file serving (fixed allowlist — no path is ever built from user input)
 // ---------------------------------------------------------------------------
 
-const PUBLIC_DIR = path.join(__dirname, 'public');
+const PUBLIC_DIR = path.join(__dirname, "public");
 
 const STATIC_ROUTES = new Map([
-  ['/', { file: 'index.html', type: 'text/html; charset=utf-8' }],
-  ['/index.html', { file: 'index.html', type: 'text/html; charset=utf-8' }],
-  ['/app.js', { file: 'app.js', type: 'text/javascript; charset=utf-8' }],
-  ['/styles.css', { file: 'styles.css', type: 'text/css; charset=utf-8' }],
+  ["/", { file: "index.html", type: "text/html; charset=utf-8" }],
+  ["/index.html", { file: "index.html", type: "text/html; charset=utf-8" }],
+  ["/app.js", { file: "app.js", type: "text/javascript; charset=utf-8" }],
+  ["/styles.css", { file: "styles.css", type: "text/css; charset=utf-8" }],
 ]);
 
 // Read once at boot. Files are trusted repo content, never user data.
 const STATIC_CACHE = new Map();
 for (const [, route] of STATIC_ROUTES) {
   if (!STATIC_CACHE.has(route.file)) {
-    STATIC_CACHE.set(route.file, fs.readFileSync(path.join(PUBLIC_DIR, route.file)));
+    STATIC_CACHE.set(
+      route.file,
+      fs.readFileSync(path.join(PUBLIC_DIR, route.file)),
+    );
   }
 }
 
 const SECURITY_HEADERS = {
   // No inline script, no external anything. 'self' covers app.js/styles.css.
   // connect-src includes ws:/wss: so the page can open its own socket.
-  'Content-Security-Policy': [
+  "Content-Security-Policy": [
     "default-src 'none'",
     "script-src 'self'",
     "style-src 'self'",
@@ -77,13 +81,14 @@ const SECURITY_HEADERS = {
     "base-uri 'none'",
     "form-action 'none'",
     "frame-ancestors 'none'",
-  ].join('; '),
-  'X-Content-Type-Options': 'nosniff',
-  'X-Frame-Options': 'DENY',
-  'Referrer-Policy': 'no-referrer',
-  'Permissions-Policy': 'geolocation=(), microphone=(), camera=(), interest-cohort=()',
-  'Cross-Origin-Opener-Policy': 'same-origin',
-  'Cross-Origin-Resource-Policy': 'same-origin',
+  ].join("; "),
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "Permissions-Policy":
+    "geolocation=(), microphone=(), camera=(), interest-cohort=()",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Resource-Policy": "same-origin",
 };
 
 const server = http.createServer((req, res) => {
@@ -91,9 +96,9 @@ const server = http.createServer((req, res) => {
     res.setHeader(key, value);
   }
 
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    res.writeHead(405, { Allow: 'GET, HEAD', 'Content-Type': 'text/plain' });
-    res.end('Method Not Allowed');
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    res.writeHead(405, { Allow: "GET, HEAD", "Content-Type": "text/plain" });
+    res.end("Method Not Allowed");
     return;
   }
 
@@ -101,29 +106,38 @@ const server = http.createServer((req, res) => {
   // allowlist, so "../" and friends can never reach the filesystem.
   let pathname;
   try {
-    pathname = new URL(req.url, 'http://localhost').pathname;
+    pathname = new URL(req.url, "http://localhost").pathname;
   } catch {
-    res.writeHead(400, { 'Content-Type': 'text/plain' });
-    res.end('Bad Request');
+    res.writeHead(400, { "Content-Type": "text/plain" });
+    res.end("Bad Request");
     return;
   }
 
-  if (pathname === '/healthz') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, rooms: rooms.size, connections: totalConnections }));
+  if (pathname === "/healthz") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        rooms: rooms.size,
+        connections: totalConnections,
+      }),
+    );
     return;
   }
 
   const route = STATIC_ROUTES.get(pathname);
   if (!route) {
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('Not Found');
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not Found");
     return;
   }
 
   const body = STATIC_CACHE.get(route.file);
-  res.writeHead(200, { 'Content-Type': route.type, 'Content-Length': body.length });
-  res.end(req.method === 'HEAD' ? undefined : body);
+  res.writeHead(200, {
+    "Content-Type": route.type,
+    "Content-Length": body.length,
+  });
+  res.end(req.method === "HEAD" ? undefined : body);
 });
 
 // ---------------------------------------------------------------------------
@@ -137,12 +151,12 @@ const connectionsPerIp = new Map();
 let totalConnections = 0;
 
 // Excludes I/O/0/1 so a code read aloud over the phone is unambiguous.
-const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 /** Rejection-sampled so every code is uniformly distributed (32 divides 256). */
 function randomCode(length = 6) {
   const bytes = crypto.randomBytes(length);
-  let out = '';
+  let out = "";
   for (let i = 0; i < length; i++) {
     out += CODE_ALPHABET[bytes[i] % CODE_ALPHABET.length];
   }
@@ -171,6 +185,9 @@ function createRoom() {
     spectators: new Set(),
     scores: { [RED]: 0, [YELLOW]: 0, draws: 0 },
     rematchVotes: new Set(),
+    /** @type {Array<{id:number,name:string,seat:string,text:string,ts:number}>} */
+    chat: [],
+    chatSeq: 0,
     createdAt: Date.now(),
     lastActivity: Date.now(),
   };
@@ -179,7 +196,9 @@ function createRoom() {
 }
 
 function deleteRoomIfEmpty(room) {
-  const seated = [...room.seats.values()].filter((p) => p.ws && p.ws.readyState === 1);
+  const seated = [...room.seats.values()].filter(
+    (p) => p.ws && p.ws.readyState === 1,
+  );
   if (seated.length === 0 && room.spectators.size === 0) {
     rooms.delete(room.code);
   }
@@ -194,20 +213,51 @@ function deleteRoomIfEmpty(room) {
  * The client also renders via textContent, giving two independent layers.
  */
 function sanitizeName(raw, fallback) {
-  if (typeof raw !== 'string') return fallback;
+  if (typeof raw !== "string") return fallback;
   const cleaned = raw
-    .normalize('NFKC')
+    .normalize("NFKC")
     // Strip C0/C1 controls, zero-width joiners, bidi overrides, and combining marks.
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, '')
-    .replace(/\s+/g, ' ')
+    .replace(
+      /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g,
+      "",
+    )
+    .replace(/\s+/g, " ")
     .trim()
     .slice(0, LIMITS.maxNameLength);
   return cleaned.length > 0 ? cleaned : fallback;
 }
 
+/**
+ * Chat is the only free-form text one player can put in front of another, so it
+ * is the sharpest edge in the app. Returns null for anything unusable.
+ *
+ * Note what this deliberately does NOT do: it does not strip or escape `<`, `>`
+ * or `&`. Escaping here would be defence in the wrong layer — the client renders
+ * chat with textContent, where markup is inert, and pre-escaping would only mean
+ * players see a literal `&lt;` when they type `<`. The invariant to protect is
+ * "never assign user text to innerHTML", which is enforced in app.js.
+ */
+function sanitizeChat(raw) {
+  if (typeof raw !== "string") return null;
+  const cleaned = raw
+    .normalize("NFKC")
+    // Controls, zero-width characters and bidi overrides. Bidi in particular can
+    // visually reorder a line so it reads as something the sender did not type.
+    .replace(
+      /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g,
+      "",
+    )
+    // Collapse runs of whitespace (including newlines) so nobody can scroll the
+    // log away with a single message full of blank lines.
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, LIMITS.maxChatLength);
+  return cleaned.length > 0 ? cleaned : null;
+}
+
 /** Room codes from clients are uppercased and checked against the alphabet. */
 function sanitizeRoomCode(raw) {
-  if (typeof raw !== 'string' || raw.length !== 6) return null;
+  if (typeof raw !== "string" || raw.length !== 6) return null;
   const upper = raw.toUpperCase();
   for (const ch of upper) {
     if (!CODE_ALPHABET.includes(ch)) return null;
@@ -217,9 +267,9 @@ function sanitizeRoomCode(raw) {
 
 /** Constant-time compare that tolerates length mismatch without leaking it. */
 function safeTokenEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const ba = Buffer.from(a, 'utf8');
-  const bb = Buffer.from(b, 'utf8');
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const ba = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
   if (ba.length !== bb.length) return false;
   return crypto.timingSafeEqual(ba, bb);
 }
@@ -257,55 +307,55 @@ function originAllowed(req) {
   return false;
 }
 
-server.on('upgrade', (req, socket, head) => {
+server.on("upgrade", (req, socket, head) => {
   let pathname;
   try {
-    pathname = new URL(req.url, 'http://localhost').pathname;
+    pathname = new URL(req.url, "http://localhost").pathname;
   } catch {
     socket.destroy();
     return;
   }
 
-  if (pathname !== '/ws') {
-    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+  if (pathname !== "/ws") {
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
     socket.destroy();
     return;
   }
 
   if (!originAllowed(req)) {
-    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
     socket.destroy();
     return;
   }
 
   if (totalConnections >= LIMITS.maxConnections) {
-    socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+    socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
     socket.destroy();
     return;
   }
 
   const ip = clientIp(req);
   if ((connectionsPerIp.get(ip) || 0) >= LIMITS.maxConnectionsPerIp) {
-    socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+    socket.write("HTTP/1.1 429 Too Many Requests\r\n\r\n");
     socket.destroy();
     return;
   }
 
   wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req);
+    wss.emit("connection", ws, req);
   });
 });
 
 function clientIp(req) {
   // Only trust X-Forwarded-For when explicitly told we are behind a proxy,
   // otherwise any client could spoof the header to evade per-IP limits.
-  if (process.env.TRUST_PROXY === '1') {
-    const xff = req.headers['x-forwarded-for'];
-    if (typeof xff === 'string' && xff.length > 0) {
-      return xff.split(',')[0].trim();
+  if (process.env.TRUST_PROXY === "1") {
+    const xff = req.headers["x-forwarded-for"];
+    if (typeof xff === "string" && xff.length > 0) {
+      return xff.split(",")[0].trim();
     }
   }
-  return req.socket.remoteAddress || 'unknown';
+  return req.socket.remoteAddress || "unknown";
 }
 
 function send(ws, type, payload) {
@@ -314,7 +364,7 @@ function send(ws, type, payload) {
 }
 
 function fail(ws, code, message) {
-  send(ws, 'error', { code, message });
+  send(ws, "error", { code, message });
 }
 
 /** Public view of a room — never includes any player's private token. */
@@ -333,14 +383,18 @@ function roomState(room) {
     winningCells: room.game.winningCells,
     lastMove: room.game.lastMove,
     players: { red: seat(RED), yellow: seat(YELLOW) },
-    scores: { red: room.scores[RED], yellow: room.scores[YELLOW], draws: room.scores.draws },
+    scores: {
+      red: room.scores[RED],
+      yellow: room.scores[YELLOW],
+      draws: room.scores.draws,
+    },
     spectators: room.spectators.size,
     rematchVotes: [...room.rematchVotes],
   };
 }
 
 function broadcast(room) {
-  const message = JSON.stringify({ type: 'state', state: roomState(room) });
+  const message = JSON.stringify({ type: "state", state: roomState(room) });
   for (const player of room.seats.values()) {
     if (player.ws && player.ws.readyState === 1) player.ws.send(message);
   }
@@ -349,7 +403,7 @@ function broadcast(room) {
   }
 }
 
-wss.on('connection', (ws, req) => {
+wss.on("connection", (ws, req) => {
   const ip = clientIp(req);
   totalConnections += 1;
   connectionsPerIp.set(ip, (connectionsPerIp.get(ip) || 0) + 1);
@@ -360,37 +414,42 @@ wss.on('connection', (ws, req) => {
     room: null,
     seat: null, // RED | YELLOW | null (null = spectator)
     token: null,
+    name: null,
     tokens: LIMITS.rateBurst,
     lastRefill: Date.now(),
+    // Chat gets its own bucket so spamming the log cannot be hidden inside the
+    // generic message allowance.
+    chatTokens: LIMITS.chatBurst,
+    chatLastRefill: Date.now(),
   };
   ws.ctx = ctx;
   ws.isAlive = true;
 
-  ws.on('pong', () => {
+  ws.on("pong", () => {
     ws.isAlive = true;
   });
 
-  ws.on('message', (data, isBinary) => {
+  ws.on("message", (data, isBinary) => {
     if (isBinary) {
-      fail(ws, 'bad_frame', 'Binary frames are not accepted.');
+      fail(ws, "bad_frame", "Binary frames are not accepted.");
       return;
     }
 
     if (!consumeRateToken(ctx)) {
-      fail(ws, 'rate_limited', 'Slow down.');
+      fail(ws, "rate_limited", "Slow down.");
       return;
     }
 
     let msg;
     try {
-      msg = JSON.parse(data.toString('utf8'));
+      msg = JSON.parse(data.toString("utf8"));
     } catch {
-      fail(ws, 'bad_json', 'Malformed message.');
+      fail(ws, "bad_json", "Malformed message.");
       return;
     }
 
-    if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) {
-      fail(ws, 'bad_message', 'Malformed message.');
+    if (msg === null || typeof msg !== "object" || Array.isArray(msg)) {
+      fail(ws, "bad_message", "Malformed message.");
       return;
     }
 
@@ -398,12 +457,12 @@ wss.on('connection', (ws, req) => {
       handleMessage(ws, ctx, msg);
     } catch (err) {
       // A bug in one handler must never take the process down.
-      console.error('[handler]', err && err.message);
-      fail(ws, 'server_error', 'Something went wrong.');
+      console.error("[handler]", err && err.message);
+      fail(ws, "server_error", "Something went wrong.");
     }
   });
 
-  ws.on('close', () => {
+  ws.on("close", () => {
     totalConnections -= 1;
     const n = (connectionsPerIp.get(ip) || 1) - 1;
     if (n <= 0) connectionsPerIp.delete(ip);
@@ -426,11 +485,17 @@ wss.on('connection', (ws, req) => {
     deleteRoomIfEmpty(room);
   });
 
-  ws.on('error', () => {
-    try { ws.terminate(); } catch { /* already gone */ }
+  ws.on("error", () => {
+    try {
+      ws.terminate();
+    } catch {
+      /* already gone */
+    }
   });
 
-  send(ws, 'hello', { limits: { cols: COLS, rows: ROWS, maxNameLength: LIMITS.maxNameLength } });
+  send(ws, "hello", {
+    limits: { cols: COLS, rows: ROWS, maxNameLength: LIMITS.maxNameLength },
+  });
 });
 
 function consumeRateToken(ctx) {
@@ -446,75 +511,100 @@ function consumeRateToken(ctx) {
   return true;
 }
 
+function consumeChatToken(ctx) {
+  const now = Date.now();
+  const elapsedSec = (now - ctx.chatLastRefill) / 1000;
+  ctx.chatLastRefill = now;
+  ctx.chatTokens = Math.min(
+    LIMITS.chatBurst,
+    ctx.chatTokens + elapsedSec * LIMITS.chatRefillPerSec,
+  );
+  if (ctx.chatTokens < 1) return false;
+  ctx.chatTokens -= 1;
+  return true;
+}
+
 function handleMessage(ws, ctx, msg) {
   switch (msg.type) {
-    case 'create':
+    case "create":
       return handleCreate(ws, ctx, msg);
-    case 'join':
+    case "join":
       return handleJoin(ws, ctx, msg);
-    case 'move':
+    case "move":
       return handleMove(ws, ctx, msg);
-    case 'rematch':
+    case "rematch":
       return handleRematch(ws, ctx);
-    case 'leave':
-      return ws.close(1000, 'left');
-    case 'ping':
-      return send(ws, 'pong', {});
+    case "chat":
+      return handleChat(ws, ctx, msg);
+    case "leave":
+      return ws.close(1000, "left");
+    case "ping":
+      return send(ws, "pong", {});
     default:
-      return fail(ws, 'unknown_type', 'Unsupported message type.');
+      return fail(ws, "unknown_type", "Unsupported message type.");
   }
 }
 
 function handleCreate(ws, ctx, msg) {
-  if (ctx.room) return fail(ws, 'already_in_room', 'You are already in a room.');
+  if (ctx.room)
+    return fail(ws, "already_in_room", "You are already in a room.");
 
   const room = createRoom();
-  if (!room) return fail(ws, 'server_busy', 'Too many active rooms. Try again shortly.');
+  if (!room)
+    return fail(ws, "server_busy", "Too many active rooms. Try again shortly.");
 
-  const name = sanitizeName(msg.name, 'Red');
-  const token = crypto.randomBytes(32).toString('base64url');
+  const name = sanitizeName(msg.name, "Red");
+  const token = crypto.randomBytes(32).toString("base64url");
 
   room.seats.set(RED, { name, ws, token });
   ctx.room = room;
   ctx.seat = RED;
   ctx.token = token;
+  ctx.name = name;
   room.lastActivity = Date.now();
 
   // The token is sent only to its owner and only over this socket.
-  send(ws, 'joined', { code: room.code, seat: 'red', token });
+  send(ws, "joined", { code: room.code, seat: "red", token });
   broadcast(room);
 }
 
 function handleJoin(ws, ctx, msg) {
-  if (ctx.room) return fail(ws, 'already_in_room', 'You are already in a room.');
+  if (ctx.room)
+    return fail(ws, "already_in_room", "You are already in a room.");
 
   const code = sanitizeRoomCode(msg.code);
-  if (!code) return fail(ws, 'bad_code', 'That invite code is not valid.');
+  if (!code) return fail(ws, "bad_code", "That invite code is not valid.");
 
   const room = rooms.get(code);
-  if (!room) return fail(ws, 'no_such_room', 'No room with that code.');
+  if (!room) return fail(ws, "no_such_room", "No room with that code.");
 
   room.lastActivity = Date.now();
 
   // 1. Reconnect: a matching token reclaims the original seat.
-  if (typeof msg.token === 'string') {
+  if (typeof msg.token === "string") {
     for (const seatNum of [RED, YELLOW]) {
       const player = room.seats.get(seatNum);
       if (player && safeTokenEqual(player.token, msg.token)) {
         if (player.ws && player.ws.readyState === 1 && player.ws !== ws) {
           // Same token from a second live socket: the newest wins, the old
           // one is closed so a stolen token can't silently mirror the game.
-          try { player.ws.close(4001, 'replaced'); } catch { /* ignore */ }
+          try {
+            player.ws.close(4001, "replaced");
+          } catch {
+            /* ignore */
+          }
         }
         player.ws = ws;
         ctx.room = room;
         ctx.seat = seatNum;
         ctx.token = player.token;
-        send(ws, 'joined', {
+        ctx.name = player.name;
+        send(ws, "joined", {
           code: room.code,
-          seat: seatNum === RED ? 'red' : 'yellow',
+          seat: seatNum === RED ? "red" : "yellow",
           token: player.token,
         });
+        sendChatHistory(ws, room);
         broadcast(room);
         return;
       }
@@ -524,17 +614,19 @@ function handleJoin(ws, ctx, msg) {
   // 2. Take a free seat.
   for (const seatNum of [RED, YELLOW]) {
     if (!room.seats.has(seatNum)) {
-      const name = sanitizeName(msg.name, seatNum === RED ? 'Red' : 'Yellow');
-      const token = crypto.randomBytes(32).toString('base64url');
+      const name = sanitizeName(msg.name, seatNum === RED ? "Red" : "Yellow");
+      const token = crypto.randomBytes(32).toString("base64url");
       room.seats.set(seatNum, { name, ws, token });
       ctx.room = room;
       ctx.seat = seatNum;
       ctx.token = token;
-      send(ws, 'joined', {
+      ctx.name = name;
+      send(ws, "joined", {
         code: room.code,
-        seat: seatNum === RED ? 'red' : 'yellow',
+        seat: seatNum === RED ? "red" : "yellow",
         token,
       });
+      sendChatHistory(ws, room);
       broadcast(room);
       return;
     }
@@ -542,40 +634,98 @@ function handleJoin(ws, ctx, msg) {
 
   // 3. Both seats taken -> spectate.
   if (room.spectators.size >= LIMITS.maxSpectatorsPerRoom) {
-    return fail(ws, 'room_full', 'This room is full.');
+    return fail(ws, "room_full", "This room is full.");
   }
   room.spectators.add(ws);
   ctx.room = room;
   ctx.seat = null;
-  send(ws, 'joined', { code: room.code, seat: 'spectator', token: null });
+  ctx.name = sanitizeName(msg.name, "Spectator");
+  send(ws, "joined", { code: room.code, seat: "spectator", token: null });
+  sendChatHistory(ws, room);
   broadcast(room);
+}
+
+/** Replays the bounded backlog to a socket that just joined. */
+function sendChatHistory(ws, room) {
+  if (room.chat.length === 0) return;
+  send(ws, "chat_history", { messages: room.chat });
+}
+
+function handleChat(ws, ctx, msg) {
+  const room = ctx.room;
+  if (!room) return fail(ws, "not_in_room", "Join a room first.");
+
+  // Checked before sanitising so a flood of junk cannot burn CPU on
+  // normalisation. The generic limiter has already run for this frame.
+  if (!consumeChatToken(ctx)) {
+    return fail(ws, "chat_rate_limited", "You are sending messages too fast.");
+  }
+
+  const text = sanitizeChat(msg.text);
+  if (text === null) {
+    return fail(ws, "bad_chat", "That message is empty or not valid text.");
+  }
+
+  // The name is taken from server-side connection state, never from the
+  // message, so a client cannot speak under another player's name.
+  const seatedPlayer = ctx.seat ? room.seats.get(ctx.seat) : null;
+  if (ctx.seat && (!seatedPlayer || seatedPlayer.ws !== ws)) {
+    return fail(ws, "stale_seat", "Your seat is no longer active.");
+  }
+
+  const entry = {
+    id: ++room.chatSeq,
+    name: seatedPlayer ? seatedPlayer.name : ctx.name || "Spectator",
+    seat:
+      ctx.seat === RED ? "red" : ctx.seat === YELLOW ? "yellow" : "spectator",
+    text,
+    ts: Date.now(),
+  };
+
+  room.chat.push(entry);
+  if (room.chat.length > LIMITS.maxChatHistory) {
+    room.chat.splice(0, room.chat.length - LIMITS.maxChatHistory);
+  }
+  room.lastActivity = Date.now();
+
+  broadcastChat(room, entry);
+}
+
+function broadcastChat(room, entry) {
+  const message = JSON.stringify({ type: "chat", message: entry });
+  for (const player of room.seats.values()) {
+    if (player.ws && player.ws.readyState === 1) player.ws.send(message);
+  }
+  for (const ws of room.spectators) {
+    if (ws.readyState === 1) ws.send(message);
+  }
 }
 
 function handleMove(ws, ctx, msg) {
   const room = ctx.room;
-  if (!room) return fail(ws, 'not_in_room', 'Join a room first.');
-  if (!ctx.seat) return fail(ws, 'spectator', 'Spectators cannot move.');
+  if (!room) return fail(ws, "not_in_room", "Join a room first.");
+  if (!ctx.seat) return fail(ws, "spectator", "Spectators cannot move.");
 
   const player = room.seats.get(ctx.seat);
   // Re-verify ownership: the seat must still belong to THIS socket.
   if (!player || player.ws !== ws) {
-    return fail(ws, 'stale_seat', 'Your seat is no longer active.');
+    return fail(ws, "stale_seat", "Your seat is no longer active.");
   }
 
   if (room.seats.size < 2) {
-    return fail(ws, 'waiting', 'Waiting for an opponent.');
+    return fail(ws, "waiting", "Waiting for an opponent.");
   }
 
   // `msg.column` is the ONLY game input a client can supply. Everything else
   // about the board is derived server-side.
   const result = applyMove(room.game, ctx.seat, msg.column);
   if (!result.ok) {
-    return fail(ws, result.error, 'That move is not allowed.');
+    return fail(ws, result.error, "That move is not allowed.");
   }
 
-  if (room.game.status === 'won') {
+  if (room.game.status === "won") {
     room.scores[room.game.winner] += 1;
-  } else if (room.game.status === 'draw') {
+  } else if (room.game.status === "draw") {
     room.scores.draws += 1;
   }
 
@@ -586,15 +736,15 @@ function handleMove(ws, ctx, msg) {
 
 function handleRematch(ws, ctx) {
   const room = ctx.room;
-  if (!room) return fail(ws, 'not_in_room', 'Join a room first.');
-  if (!ctx.seat) return fail(ws, 'spectator', 'Spectators cannot vote.');
-  if (room.game.status === 'playing') {
-    return fail(ws, 'game_in_progress', 'Finish the game first.');
+  if (!room) return fail(ws, "not_in_room", "Join a room first.");
+  if (!ctx.seat) return fail(ws, "spectator", "Spectators cannot vote.");
+  if (room.game.status === "playing") {
+    return fail(ws, "game_in_progress", "Finish the game first.");
   }
 
   const player = room.seats.get(ctx.seat);
   if (!player || player.ws !== ws) {
-    return fail(ws, 'stale_seat', 'Your seat is no longer active.');
+    return fail(ws, "stale_seat", "Your seat is no longer active.");
   }
 
   room.rematchVotes.add(ctx.seat);
@@ -626,7 +776,11 @@ const heartbeat = setInterval(() => {
       continue;
     }
     ws.isAlive = false;
-    try { ws.ping(); } catch { /* socket already closing */ }
+    try {
+      ws.ping();
+    } catch {
+      /* socket already closing */
+    }
   }
 }, LIMITS.heartbeatMs);
 heartbeat.unref();
@@ -649,13 +803,17 @@ function shutdown(signal) {
   clearInterval(heartbeat);
   clearInterval(reaper);
   for (const ws of wss.clients) {
-    try { ws.close(1001, 'server shutting down'); } catch { /* ignore */ }
+    try {
+      ws.close(1001, "server shutting down");
+    } catch {
+      /* ignore */
+    }
   }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
 }
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 if (require.main === module) {
   server.listen(PORT, HOST, () => {
@@ -663,4 +821,13 @@ if (require.main === module) {
   });
 }
 
-module.exports = { server, wss, rooms, sanitizeName, sanitizeRoomCode, randomCode };
+module.exports = {
+  server,
+  wss,
+  rooms,
+  sanitizeName,
+  sanitizeChat,
+  sanitizeRoomCode,
+  randomCode,
+  LIMITS,
+};

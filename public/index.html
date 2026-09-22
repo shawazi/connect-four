@@ -76,6 +76,19 @@
       <button class="btn btn-ghost" id="leave-btn">Leave</button>
     </div>
 
+    <section class="chat" id="chat">
+      <div class="chat-head">
+        <span class="chat-title">Chat</span>
+        <span class="chat-note" id="chat-note"></span>
+      </div>
+      <ol class="chat-log" id="chat-log" aria-live="polite" aria-label="Chat messages"></ol>
+      <form class="chat-form" id="chat-form">
+        <input id="chat-input" type="text" maxlength="300" autocomplete="off"
+               placeholder="Say something…" aria-label="Chat message">
+        <button class="btn btn-small" id="chat-send" type="submit">Send</button>
+      </form>
+    </section>
+
     <p class="you" id="you"></p>
   </section>
 
