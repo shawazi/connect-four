@@ -1,0 +1,39 @@
+[Unit]
+Description=Connect Four game server (multiplayer, WebSocket)
+Documentation=file:///home/shawaz/code/connect-four/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/shawaz/code/connect-four
+# Bound to all interfaces so both the LAN invite and the tunnel work.
+# ALLOWED_ORIGINS must list the public hostname or the WebSocket upgrade is
+# refused by the server's own CSWSH check.
+Environment=PORT=3000
+Environment=HOST=0.0.0.0
+Environment=ALLOWED_ORIGINS=https://c4.specialcast.win
+# Behind cloudflared every request arrives from 127.0.0.1, so without this the
+# per-IP connection cap would apply to all public players at once.
+Environment=TRUST_PROXY=1
+ExecStart=/run/current-system/sw/bin/node server.js
+Restart=on-failure
+RestartSec=3
+
+# Hardening: the process needs nothing but its own directory and a socket.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+# MemoryDenyWriteExecute is deliberately NOT set: V8 JITs, so it needs W+X
+# pages and the process dies with SIGTRAP on startup.
+
+[Install]
+WantedBy=default.target

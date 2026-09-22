@@ -55,23 +55,47 @@ one field — `column` — which is validated as an integer in `[0, 7)` before i
 is used. A client cannot send a board, claim a win, move twice, move as its
 opponent, or move after the game ends.
 
-| Concern | Mitigation |
-|---|---|
-| Cheating / forged state | All rules server-side; `column` is the only client input |
-| Seat hijacking | 256-bit `crypto.randomBytes` token per seat, compared with `timingSafeEqual`; tokens are sent only to their owner and never appear in broadcast state |
-| Cross-site WebSocket hijacking | `Origin` checked against `Host` on upgrade; extra origins via `ALLOWED_ORIGINS` |
-| XSS | Strict CSP (`default-src 'none'`, no inline script or style); names stripped of control/zero-width/bidi characters server-side *and* rendered with `textContent` |
-| Path traversal | Static files served from a fixed route allowlist read into memory at boot — no filesystem path is ever built from a request |
-| Clickjacking | `X-Frame-Options: DENY` + `frame-ancestors 'none'` |
-| Message flooding | Per-connection token bucket (5/s sustained, burst 20) |
-| Memory exhaustion | 4 KB frame cap, caps on rooms/connections/connections-per-IP/spectators, idle rooms reaped after 30 min |
-| Compression amplification | `permessage-deflate` disabled |
-| Dead connections | 30s ping/pong heartbeat, unresponsive sockets terminated |
-| Crash from bad input | Every handler is wrapped; parse failures answer with an error frame instead of throwing |
-| Header spoofing | `X-Forwarded-For` is only honoured when `TRUST_PROXY=1` |
+| Concern                        | Mitigation                                                                                                                                                       |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cheating / forged state        | All rules server-side; `column` is the only client input                                                                                                         |
+| Seat hijacking                 | 256-bit `crypto.randomBytes` token per seat, compared with `timingSafeEqual`; tokens are sent only to their owner and never appear in broadcast state            |
+| Cross-site WebSocket hijacking | `Origin` checked against `Host` on upgrade; extra origins via `ALLOWED_ORIGINS`                                                                                  |
+| XSS                            | Strict CSP (`default-src 'none'`, no inline script or style); names stripped of control/zero-width/bidi characters server-side _and_ rendered with `textContent` |
+| Path traversal                 | Static files served from a fixed route allowlist read into memory at boot — no filesystem path is ever built from a request                                      |
+| Clickjacking                   | `X-Frame-Options: DENY` + `frame-ancestors 'none'`                                                                                                               |
+| Message flooding               | Per-connection token bucket (5/s sustained, burst 20)                                                                                                            |
+| Memory exhaustion              | 4 KB frame cap, caps on rooms/connections/connections-per-IP/spectators, idle rooms reaped after 30 min                                                          |
+| Compression amplification      | `permessage-deflate` disabled                                                                                                                                    |
+| Dead connections               | 30s ping/pong heartbeat, unresponsive sockets terminated                                                                                                         |
+| Crash from bad input           | Every handler is wrapped; parse failures answer with an error frame instead of throwing                                                                          |
+| Header spoofing                | `X-Forwarded-For` is only honoured when `TRUST_PROXY=1`                                                                                                          |
 
 Dependencies: one (`ws`). No database, no user accounts, no cookies, no
 telemetry, nothing persisted to disk.
+
+### Deployed setup (this machine)
+
+Live at **https://c4.specialcast.win** via a Cloudflare named tunnel. Two user
+services in `deploy/`, installed to `~/.config/systemd/user/`:
+
+```bash
+systemctl --user status connect-four.service         # the node server
+systemctl --user status connect-four-tunnel.service  # cloudflared
+```
+
+Two things that are easy to get wrong here:
+
+- The tunnel runs with `--config ~/.cloudflared/connect-four.yml`, **not** the
+  default `~/.cloudflared/config.yml`. That default pins a different tunnel and
+  ends in a `http_status:404` catch-all, so anything that picks it up silently
+  serves the wrong ingress and 404s everything.
+- `connect-four.service` must **not** set `MemoryDenyWriteExecute=true`. V8 JITs,
+  so the process dies immediately with `SIGTRAP`.
+
+`ALLOWED_ORIGINS` must match the public hostname or the server's own CSWSH check
+refuses the WebSocket upgrade. `TRUST_PROXY=1` is required behind the tunnel —
+otherwise every request looks like it comes from `127.0.0.1` and the per-IP
+connection cap applies to all players at once.
 
 ### Behind a proxy
 
