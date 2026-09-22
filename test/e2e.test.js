@@ -503,6 +503,166 @@ async function main() {
     !JSON.stringify(history).includes(joinedA.token),
   );
 
+  console.log("\nlobby");
+
+  const L1 = client();
+  const L2 = client();
+  await Promise.all([L1.open(), L2.open()]);
+  await L1.wait(isType("hello"));
+  await L2.wait(isType("hello"));
+
+  L1.send({ type: "lobby_join", name: "Lobbyist" });
+  const lj = await L1.wait(isType("lobby_joined"));
+  check("joining the lobby is acknowledged", lj.name === "Lobbyist", lj.name);
+  const firstList = await L1.wait(isType("game_list"));
+  check("the lobby receives a game list", Array.isArray(firstList.games));
+
+  L2.send({ type: "lobby_join", name: "Second" });
+  await L2.wait(isType("lobby_joined"));
+
+  // Lobby chat reaches other lobby members.
+  L2.drain();
+  L1.send({ type: "lobby_chat", text: "anyone for a game?" });
+  const lobbyMsg = await L2.wait(isType("lobby_chat"));
+  check(
+    "lobby chat reaches other lobby members",
+    lobbyMsg.message.text === "anyone for a game?",
+  );
+  check(
+    "lobby chat name comes from the server",
+    lobbyMsg.message.name === "Lobbyist",
+    lobbyMsg.message.name,
+  );
+
+  L2.drain();
+  L1.send({ type: "lobby_chat", text: "x", name: "Impostor" });
+  const lobbySpoof = await L2.wait(isType("lobby_chat"));
+  check(
+    "a client cannot forge its lobby chat name",
+    lobbySpoof.message.name === "Lobbyist",
+    lobbySpoof.message.name,
+  );
+
+  // --- the core privacy property of the list ---
+  const priv = client();
+  await priv.open();
+  await priv.wait(isType("hello"));
+  priv.send({ type: "create", name: "PrivateHost" });
+  const privJoined = await priv.wait(isType("joined"));
+  check(
+    "a game with no visibility field is private",
+    privJoined.visibility === "private",
+    String(privJoined.visibility),
+  );
+
+  const pub = client();
+  await pub.open();
+  await pub.wait(isType("hello"));
+  pub.send({ type: "create", name: "PublicHost", visibility: "public" });
+  const pubJoined = await pub.wait(isType("joined"));
+  check(
+    "an explicitly public game is public",
+    pubJoined.visibility === "public",
+    String(pubJoined.visibility),
+  );
+
+  const listMsg = await L1.wait(
+    (m) =>
+      m.type === "game_list" && m.games.some((g) => g.code === pubJoined.code),
+    5000,
+  );
+  const codes = listMsg.games.map((g) => g.code);
+  check(
+    "a public game appears in the lobby list",
+    codes.includes(pubJoined.code),
+  );
+  check(
+    "a PRIVATE game code never appears in the list",
+    !codes.includes(privJoined.code),
+  );
+  check(
+    "the list carries no seat tokens",
+    !JSON.stringify(listMsg).includes(pubJoined.token),
+  );
+  check(
+    "the list exposes only code/host/meta",
+    listMsg.games.every((g) =>
+      Object.keys(g).every((k) =>
+        ["code", "host", "spectators", "createdAt"].includes(k),
+      ),
+    ),
+  );
+
+  // Truthy-but-not-"public" values must not opt a room in.
+  for (const sneaky of ["PUBLIC", "Public", 1, true, "yes", {}]) {
+    const s = client();
+    await s.open();
+    await s.wait(isType("hello"));
+    s.send({ type: "create", name: "Sneaky", visibility: sneaky });
+    const sj = await s.wait(isType("joined"));
+    check(
+      `visibility=${JSON.stringify(sneaky)} does not make a game public`,
+      sj.visibility === "private",
+      String(sj.visibility),
+    );
+    s.close();
+  }
+
+  // A filled game drops off the list.
+  const filler = client();
+  await filler.open();
+  await filler.wait(isType("hello"));
+  L1.drain();
+  filler.send({ type: "join", code: pubJoined.code, name: "Filler" });
+  await filler.wait(isType("joined"));
+  const afterFill = await L1.wait(
+    (m) =>
+      m.type === "game_list" && !m.games.some((g) => g.code === pubJoined.code),
+    5000,
+  );
+  check(
+    "a game with both seats taken is delisted",
+    !afterFill.games.some((g) => g.code === pubJoined.code),
+  );
+
+  // Lobby chat is refused for a socket that never joined the lobby.
+  const nonMember = client();
+  await nonMember.open();
+  await nonMember.wait(isType("hello"));
+  nonMember.send({ type: "lobby_chat", text: "hello" });
+  check(
+    "lobby chat requires joining the lobby",
+    (await nonMember.wait(isType("error"))).code === "not_in_lobby",
+  );
+
+  // The chat bucket is shared, so switching channels cannot double the rate.
+  const shared = client();
+  await shared.open();
+  await shared.wait(isType("hello"));
+  shared.send({ type: "lobby_join", name: "Rate" });
+  await shared.wait(isType("lobby_joined"));
+  for (let i = 0; i < 20; i++)
+    shared.send({ type: "lobby_chat", text: `s${i}` });
+  let sharedLimited = false;
+  try {
+    await shared.wait(
+      (m) => m.type === "error" && m.code === "chat_rate_limited",
+      3000,
+    );
+    sharedLimited = true;
+  } catch {
+    /* none */
+  }
+  check("lobby chat is rate limited too", sharedLimited);
+
+  for (const cl of [L1, L2, priv, pub, filler, nonMember, shared]) {
+    try {
+      cl.close();
+    } catch {
+      /* ignore */
+    }
+  }
+
   for (const cl of [a2, b, c, d, e, f, late]) {
     try {
       cl.close();

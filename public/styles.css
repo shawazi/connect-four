@@ -452,6 +452,84 @@ input[type="text"]::placeholder {
   flex: 1;
 }
 
+/* ---------- lobby: create row + game list ---------- */
+
+.create-row {
+  display: flex;
+  gap: 8px;
+}
+.create-row .btn-primary {
+  flex: 1;
+  width: auto;
+}
+
+.hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.game-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-height: 210px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.game-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  background: #0e1526;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.game-host {
+  flex: 1;
+  min-width: 0;
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.game-meta {
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.game-empty {
+  padding: 14px 4px;
+  text-align: center;
+  font-size: 13px;
+  font-style: italic;
+  color: var(--muted);
+}
+
+.lobby-chat {
+  margin-top: 16px;
+}
+.lobby-chat .chat-log {
+  height: 150px;
+}
+
+.chat-count {
+  margin-right: auto;
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
 /* ---------- chat ---------- */
 
 .chat {

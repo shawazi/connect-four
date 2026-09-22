@@ -39,6 +39,10 @@ const LIMITS = {
   // Only the last N messages are retained, so a long-running room cannot grow
   // without bound and a late joiner gets a bounded backlog.
   maxChatHistory: 50,
+  maxLobbyChatHistory: 60,
+  // The lobby list is public, so it is capped to bound both the payload size
+  // and how much a scraper learns from one request.
+  maxListedGames: 60,
   // Chat is throttled harder than moves: sustained 1/s, burst of 5. The generic
   // limiter alone would still allow 5 messages a second of spam.
   chatBurst: 5,
@@ -150,6 +154,21 @@ const rooms = new Map();
 const connectionsPerIp = new Map();
 let totalConnections = 0;
 
+/**
+ * The lobby: one global channel plus the list of joinable public games.
+ *
+ * Lobby chat reaches every connected client, not just one room, so it is the
+ * widest-reach text in the app. It shares the per-connection chat bucket with
+ * room chat so nobody can switch channels to double their message rate.
+ */
+const lobby = {
+  /** @type {Set<object>} sockets currently sitting in the lobby */
+  members: new Set(),
+  /** @type {Array<{id:number,name:string,text:string,ts:number}>} */
+  chat: [],
+  chatSeq: 0,
+};
+
 // Excludes I/O/0/1 so a code read aloud over the phone is unambiguous.
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -188,6 +207,9 @@ function createRoom() {
     /** @type {Array<{id:number,name:string,seat:string,text:string,ts:number}>} */
     chat: [],
     chatSeq: 0,
+    // Private unless the creator explicitly opts in. A listed game hands its
+    // join code to strangers, so that must never be the default.
+    visibility: "private",
     createdAt: Date.now(),
     lastActivity: Date.now(),
   };
@@ -415,6 +437,7 @@ wss.on("connection", (ws, req) => {
     seat: null, // RED | YELLOW | null (null = spectator)
     token: null,
     name: null,
+    inLobby: false,
     tokens: LIMITS.rateBurst,
     lastRefill: Date.now(),
     // Chat gets its own bucket so spamming the log cannot be hidden inside the
@@ -469,7 +492,14 @@ wss.on("connection", (ws, req) => {
     else connectionsPerIp.set(ip, n);
 
     const room = ctx.room;
-    if (!room) return;
+    if (!room) {
+      // A lobby-only socket: drop it and refresh everyone else's count.
+      if (ctx.inLobby) {
+        leaveLobby(ws, ctx);
+        broadcastGameList();
+      }
+      return;
+    }
 
     if (ctx.seat) {
       const player = room.seats.get(ctx.seat);
@@ -483,6 +513,8 @@ wss.on("connection", (ws, req) => {
     room.lastActivity = Date.now();
     broadcast(room);
     deleteRoomIfEmpty(room);
+    // A host dropping out unlists their game, so the lobby must be told.
+    broadcastGameList();
   });
 
   ws.on("error", () => {
@@ -536,6 +568,13 @@ function handleMessage(ws, ctx, msg) {
       return handleRematch(ws, ctx);
     case "chat":
       return handleChat(ws, ctx, msg);
+    case "lobby_join":
+      return handleLobbyJoin(ws, ctx, msg);
+    case "lobby_chat":
+      return handleLobbyChat(ws, ctx, msg);
+    case "lobby_leave":
+      leaveLobby(ws, ctx);
+      return broadcastGameList();
     case "leave":
       return ws.close(1000, "left");
     case "ping":
@@ -556,6 +595,10 @@ function handleCreate(ws, ctx, msg) {
   const name = sanitizeName(msg.name, "Red");
   const token = crypto.randomBytes(32).toString("base64url");
 
+  // Strict equality against the one opt-in value: anything else, including a
+  // truthy string or a missing field, leaves the room private.
+  room.visibility = msg.visibility === "public" ? "public" : "private";
+
   room.seats.set(RED, { name, ws, token });
   ctx.room = room;
   ctx.seat = RED;
@@ -563,9 +606,17 @@ function handleCreate(ws, ctx, msg) {
   ctx.name = name;
   room.lastActivity = Date.now();
 
+  leaveLobby(ws, ctx);
+
   // The token is sent only to its owner and only over this socket.
-  send(ws, "joined", { code: room.code, seat: "red", token });
+  send(ws, "joined", {
+    code: room.code,
+    seat: "red",
+    token,
+    visibility: room.visibility,
+  });
   broadcast(room);
+  broadcastGameList();
 }
 
 function handleJoin(ws, ctx, msg) {
@@ -604,8 +655,10 @@ function handleJoin(ws, ctx, msg) {
           seat: seatNum === RED ? "red" : "yellow",
           token: player.token,
         });
+        leaveLobby(ws, ctx);
         sendChatHistory(ws, room);
         broadcast(room);
+        broadcastGameList();
         return;
       }
     }
@@ -626,8 +679,10 @@ function handleJoin(ws, ctx, msg) {
         seat: seatNum === RED ? "red" : "yellow",
         token,
       });
+      leaveLobby(ws, ctx);
       sendChatHistory(ws, room);
       broadcast(room);
+      broadcastGameList();
       return;
     }
   }
@@ -640,9 +695,11 @@ function handleJoin(ws, ctx, msg) {
   ctx.room = room;
   ctx.seat = null;
   ctx.name = sanitizeName(msg.name, "Spectator");
+  leaveLobby(ws, ctx);
   send(ws, "joined", { code: room.code, seat: "spectator", token: null });
   sendChatHistory(ws, room);
   broadcast(room);
+  broadcastGameList();
 }
 
 /** Replays the bounded backlog to a socket that just joined. */
@@ -698,6 +755,115 @@ function broadcastChat(room, entry) {
   }
   for (const ws of room.spectators) {
     if (ws.readyState === 1) ws.send(message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lobby
+// ---------------------------------------------------------------------------
+
+/**
+ * The public game list.
+ *
+ * Only rooms that opted into `public` AND still have a free seat appear. A
+ * private room's code must never reach this list — it is the only thing
+ * standing between a private game and anyone who can open the homepage.
+ */
+function publicGames() {
+  const out = [];
+  for (const room of rooms.values()) {
+    if (room.visibility !== "public") continue;
+    if (room.seats.size >= 2) continue;
+
+    // A room whose only player has dropped is not worth advertising.
+    const host = [...room.seats.values()].find(
+      (p) => p.ws && p.ws.readyState === 1,
+    );
+    if (!host) continue;
+
+    out.push({
+      code: room.code,
+      host: host.name,
+      spectators: room.spectators.size,
+      createdAt: room.createdAt,
+    });
+    if (out.length >= LIMITS.maxListedGames) break;
+  }
+  // Newest first, so a fresh game is visible without scrolling.
+  out.sort((a, b) => b.createdAt - a.createdAt);
+  return out;
+}
+
+function sendGameList(ws) {
+  send(ws, "game_list", {
+    games: publicGames(),
+    lobbyCount: lobby.members.size,
+  });
+}
+
+function broadcastGameList() {
+  if (lobby.members.size === 0) return;
+  const message = JSON.stringify({
+    type: "game_list",
+    games: publicGames(),
+    lobbyCount: lobby.members.size,
+  });
+  for (const ws of lobby.members) {
+    if (ws.readyState === 1) ws.send(message);
+  }
+}
+
+function leaveLobby(ws, ctx) {
+  if (!ctx.inLobby) return;
+  lobby.members.delete(ws);
+  ctx.inLobby = false;
+}
+
+function handleLobbyJoin(ws, ctx, msg) {
+  if (ctx.room) return fail(ws, "already_in_room", "Leave your game first.");
+
+  ctx.name = sanitizeName(msg.name, "Guest");
+  lobby.members.add(ws);
+  ctx.inLobby = true;
+
+  send(ws, "lobby_joined", { name: ctx.name });
+  if (lobby.chat.length > 0) {
+    send(ws, "lobby_chat_history", { messages: lobby.chat });
+  }
+  sendGameList(ws);
+  broadcastGameList(); // refresh everyone's lobby count
+}
+
+function handleLobbyChat(ws, ctx, msg) {
+  if (!ctx.inLobby) return fail(ws, "not_in_lobby", "Join the lobby first.");
+
+  // Same bucket as room chat, deliberately: switching channels must not grant
+  // a fresh allowance.
+  if (!consumeChatToken(ctx)) {
+    return fail(ws, "chat_rate_limited", "You are sending messages too fast.");
+  }
+
+  const text = sanitizeChat(msg.text);
+  if (text === null) {
+    return fail(ws, "bad_chat", "That message is empty or not valid text.");
+  }
+
+  const entry = {
+    id: ++lobby.chatSeq,
+    // From connection state, never from the message.
+    name: ctx.name || "Guest",
+    text,
+    ts: Date.now(),
+  };
+
+  lobby.chat.push(entry);
+  if (lobby.chat.length > LIMITS.maxLobbyChatHistory) {
+    lobby.chat.splice(0, lobby.chat.length - LIMITS.maxLobbyChatHistory);
+  }
+
+  const message = JSON.stringify({ type: "lobby_chat", message: entry });
+  for (const member of lobby.members) {
+    if (member.readyState === 1) member.send(message);
   }
 }
 
@@ -828,6 +994,8 @@ module.exports = {
   sanitizeName,
   sanitizeChat,
   sanitizeRoomCode,
+  lobby,
+  publicGames,
   randomCode,
   LIMITS,
 };

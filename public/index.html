@@ -24,9 +24,13 @@
              spellcheck="false" placeholder="Player">
     </label>
 
-    <button class="btn btn-primary" id="create-btn">Create a game</button>
+    <div class="create-row">
+      <button class="btn btn-primary" id="create-btn">Create public game</button>
+      <button class="btn" id="create-private-btn">Private</button>
+    </div>
+    <p class="hint" id="create-hint">A public game is listed below for anyone to join. A private game is invite-link only.</p>
 
-    <div class="divider"><span>or</span></div>
+    <div class="divider"><span>or join with a code</span></div>
 
     <form class="join-row" id="join-form">
       <input id="code-input" type="text" maxlength="6" autocomplete="off"
@@ -35,6 +39,23 @@
     </form>
 
     <p class="lobby-error" id="lobby-error" role="alert"></p>
+
+    <div class="divider"><span>open games</span></div>
+    <ul class="game-list" id="game-list" aria-label="Open games"></ul>
+
+    <section class="chat lobby-chat" id="lobby-chat">
+      <div class="chat-head">
+        <span class="chat-title">Lobby chat</span>
+        <span class="chat-count" id="lobby-count"></span>
+        <span class="chat-note" id="lobby-chat-note"></span>
+      </div>
+      <ol class="chat-log" id="lobby-chat-log" aria-live="polite" aria-label="Lobby chat messages"></ol>
+      <form class="chat-form" id="lobby-chat-form">
+        <input id="lobby-chat-input" type="text" maxlength="300" autocomplete="off"
+               placeholder="Say hi to the lobby…" aria-label="Lobby chat message">
+        <button class="btn btn-small" id="lobby-chat-send" type="submit">Send</button>
+      </form>
+    </section>
   </section>
 
   <!-- Game -->

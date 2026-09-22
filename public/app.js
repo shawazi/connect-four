@@ -35,6 +35,13 @@
     you: $("you"),
     rematchBtn: $("rematch-btn"),
     leaveBtn: $("leave-btn"),
+    createPrivateBtn: $("create-private-btn"),
+    gameList: $("game-list"),
+    lobbyChatLog: $("lobby-chat-log"),
+    lobbyChatForm: $("lobby-chat-form"),
+    lobbyChatInput: $("lobby-chat-input"),
+    lobbyChatNote: $("lobby-chat-note"),
+    lobbyCount: $("lobby-count"),
     chatLog: $("chat-log"),
     chatForm: $("chat-form"),
     chatInput: $("chat-input"),
@@ -201,6 +208,27 @@
         addChatMessage(msg.message);
         break;
 
+      case "lobby_joined":
+        setEmpty(el.lobbyChatLog, "No messages yet. Say hello.");
+        break;
+
+      case "lobby_chat_history":
+        if (Array.isArray(msg.messages)) {
+          el.lobbyChatLog.textContent = "";
+          seenLobbyChatIds.clear();
+          msg.messages.forEach(addLobbyChatMessage);
+          setEmpty(el.lobbyChatLog, "No messages yet. Say hello.");
+        }
+        break;
+
+      case "lobby_chat":
+        addLobbyChatMessage(msg.message);
+        break;
+
+      case "game_list":
+        renderGameList(msg.games, msg.lobbyCount);
+        break;
+
       case "error":
         onError(msg);
         break;
@@ -218,16 +246,23 @@
       "waiting",
       "rate_limited",
     ];
-    // Chat problems belong next to the chat box, not in the game status line.
-    if (msg.code === "chat_rate_limited" || msg.code === "bad_chat") {
-      chatNote(
-        msg.code === "chat_rate_limited" ? "Slow down a moment." : "Not sent.",
-      );
+    // Chat problems belong next to the chat box that caused them, not in the
+    // game status line.
+    if (
+      msg.code === "chat_rate_limited" ||
+      msg.code === "bad_chat" ||
+      msg.code === "not_in_lobby"
+    ) {
+      const note =
+        msg.code === "chat_rate_limited" ? "Slow down a moment." : "Not sent.";
+      if (el.game.classList.contains("hidden")) lobbyChatNote(note);
+      else chatNote(note);
       return;
     }
     if (el.game.classList.contains("hidden")) {
       el.lobbyError.textContent = friendly(msg);
       el.createBtn.disabled = false;
+      el.createPrivateBtn.disabled = false;
       el.joinBtn.disabled = false;
     } else if (!quiet.includes(msg.code)) {
       el.status.textContent = friendly(msg);
@@ -377,6 +412,7 @@
 
   // Reconnects replay history, so ids are tracked to avoid duplicate lines.
   const seenChatIds = new Set();
+  const seenLobbyChatIds = new Set();
 
   /**
    * Appends one chat line.
@@ -388,15 +424,15 @@
    * typed rather than as an element. The server sanitises too, but this is the
    * layer that actually decides whether markup can execute.
    */
-  function addChatMessage(m) {
+  function addChatTo(logEl, m, seen) {
     if (!m || typeof m !== "object") return;
     if (typeof m.text !== "string" || typeof m.name !== "string") return;
     if (typeof m.id === "number") {
-      if (seenChatIds.has(m.id)) return;
-      seenChatIds.add(m.id);
+      if (seen.has(m.id)) return;
+      seen.add(m.id);
     }
 
-    const empty = el.chatLog.querySelector(".chat-empty");
+    const empty = logEl.querySelector(".chat-empty");
     if (empty) empty.remove();
 
     const seat = m.seat === "red" || m.seat === "yellow" ? m.seat : "spectator";
@@ -417,23 +453,104 @@
 
     // Only autoscroll if already at the bottom, so reading back isn't yanked.
     const atBottom =
-      el.chatLog.scrollHeight - el.chatLog.scrollTop - el.chatLog.clientHeight <
-      40;
-    el.chatLog.appendChild(li);
-    if (atBottom) el.chatLog.scrollTop = el.chatLog.scrollHeight;
+      logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+    logEl.appendChild(li);
+    if (atBottom) logEl.scrollTop = logEl.scrollHeight;
 
-    // Mirror the server's history cap so a long game can't grow the DOM forever.
-    while (el.chatLog.children.length > 50) {
-      el.chatLog.removeChild(el.chatLog.firstChild);
+    // Mirror the server's history cap so the DOM cannot grow without bound.
+    while (logEl.children.length > 60) {
+      logEl.removeChild(logEl.firstChild);
     }
   }
 
-  function chatNote(text) {
-    el.chatNote.textContent = text;
+  function addChatMessage(m) {
+    addChatTo(el.chatLog, m, seenChatIds);
+  }
+
+  function addLobbyChatMessage(m) {
+    addChatTo(el.lobbyChatLog, m, seenLobbyChatIds);
+  }
+
+  function setEmpty(logEl, label) {
+    if (logEl.children.length > 0) return;
+    const li = document.createElement("li");
+    li.className = "chat-empty";
+    li.textContent = label;
+    logEl.appendChild(li);
+  }
+
+  function noteOn(elem, text) {
+    elem.textContent = text;
     if (text)
       setTimeout(() => {
-        el.chatNote.textContent = "";
+        elem.textContent = "";
       }, 2500);
+  }
+
+  function chatNote(text) {
+    noteOn(el.chatNote, text);
+  }
+
+  function lobbyChatNote(text) {
+    noteOn(el.lobbyChatNote, text);
+  }
+
+  /**
+   * Renders the open-games list.
+   *
+   * Host names come from other users, so they go in via textContent like chat.
+   * The join code is put in a dataset value and read back in the click handler
+   * rather than baked into markup.
+   */
+  function renderGameList(games, lobbyCount) {
+    el.gameList.textContent = "";
+
+    if (typeof lobbyCount === "number") {
+      el.lobbyCount.textContent =
+        lobbyCount === 1 ? "1 here" : `${lobbyCount} here`;
+    }
+
+    if (!Array.isArray(games) || games.length === 0) {
+      const li = document.createElement("li");
+      li.className = "game-empty";
+      li.textContent = "No open games. Create one above.";
+      el.gameList.appendChild(li);
+      return;
+    }
+
+    for (const g of games) {
+      if (!g || typeof g.code !== "string" || typeof g.host !== "string")
+        continue;
+      // Defend against a malformed code reaching the join path.
+      if (!/^[A-Z2-9]{6}$/.test(g.code)) continue;
+
+      const li = document.createElement("li");
+      li.className = "game-item";
+
+      const host = document.createElement("span");
+      host.className = "game-host";
+      host.textContent = g.host;
+
+      const meta = document.createElement("span");
+      meta.className = "game-meta";
+      meta.textContent =
+        g.spectators > 0 ? `${g.spectators} watching` : "waiting";
+
+      const btn = document.createElement("button");
+      btn.className = "btn btn-small";
+      btn.type = "button";
+      btn.textContent = "Join";
+      btn.dataset.code = g.code;
+      btn.addEventListener("click", () => joinCode(g.code));
+
+      li.append(host, meta, btn);
+      el.gameList.appendChild(li);
+    }
+  }
+
+  function joinCode(code) {
+    el.lobbyError.textContent = "";
+    sendRaw({ type: "join", code, token: loadToken(code), name: myName() });
   }
 
   function dropIn(col) {
@@ -463,7 +580,31 @@
   el.createBtn.addEventListener("click", () => {
     el.lobbyError.textContent = "";
     el.createBtn.disabled = true;
+    sendRaw({ type: "create", name: myName(), visibility: "public" });
+  });
+
+  el.createPrivateBtn.addEventListener("click", () => {
+    el.lobbyError.textContent = "";
+    el.createPrivateBtn.disabled = true;
+    // No visibility field at all: the server defaults to private.
     sendRaw({ type: "create", name: myName() });
+  });
+
+  el.lobbyChatForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const text = el.lobbyChatInput.value.trim();
+    if (!text) return;
+    sendRaw({ type: "lobby_chat", text });
+    el.lobbyChatInput.value = "";
+    el.lobbyChatInput.focus();
+  });
+
+  // Re-announce to the lobby whenever the name changes, so the list and any
+  // later messages use the current one.
+  el.nameInput.addEventListener("change", () => {
+    if (el.game.classList.contains("hidden")) {
+      sendRaw({ type: "lobby_join", name: myName() });
+    }
   });
 
   el.joinForm.addEventListener("submit", (e) => {
@@ -530,6 +671,9 @@
   const params = new URLSearchParams(location.search);
   const roomParam = (params.get("room") || "").trim().toUpperCase();
 
+  setEmpty(el.lobbyChatLog, "No messages yet. Say hello.");
+  renderGameList([], undefined);
+
   connect(() => {
     if (/^[A-Z2-9]{6}$/.test(roomParam)) {
       sendRaw({
@@ -538,6 +682,13 @@
         token: loadToken(roomParam),
         name: myName(),
       });
+      return;
+    }
+    // No invite in the URL: land in the lobby.
+    if (myCode) {
+      sendRaw({ type: "join", code: myCode, token: myToken, name: myName() });
+    } else {
+      sendRaw({ type: "lobby_join", name: myName() });
     }
   });
 })();
