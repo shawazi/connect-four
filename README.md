@@ -73,29 +73,42 @@ opponent, or move after the game ends.
 Dependencies: one (`ws`). No database, no user accounts, no cookies, no
 telemetry, nothing persisted to disk.
 
-### Deployed setup (this machine)
+### Exposing it publicly
 
-Live at **https://c4.specialcast.win** via a Cloudflare named tunnel. Two user
-services in `deploy/`, installed to `~/.config/systemd/user/`:
+The quickest public URL, no account and no DNS setup:
 
 ```bash
-systemctl --user status connect-four.service         # the node server
-systemctl --user status connect-four-tunnel.service  # cloudflared
+cloudflared tunnel --config /dev/null --url http://127.0.0.1:3000
 ```
 
-Two things that are easy to get wrong here:
+Then restart the server with the hostname it prints:
 
-- The tunnel runs with `--config ~/.cloudflared/connect-four.yml`, **not** the
-  default `~/.cloudflared/config.yml`. That default pins a different tunnel and
-  ends in a `http_status:404` catch-all, so anything that picks it up silently
-  serves the wrong ingress and 404s everything.
-- `connect-four.service` must **not** set `MemoryDenyWriteExecute=true`. V8 JITs,
-  so the process dies immediately with `SIGTRAP`.
+```bash
+ALLOWED_ORIGINS=https://<name>.trycloudflare.com TRUST_PROXY=1 npm start
+```
 
-`ALLOWED_ORIGINS` must match the public hostname or the server's own CSWSH check
-refuses the WebSocket upgrade. `TRUST_PROXY=1` is required behind the tunnel —
-otherwise every request looks like it comes from `127.0.0.1` and the per-IP
-connection cap applies to all players at once.
+Four things that cost real time when they go wrong:
+
+- **Pass `--config`.** Without it cloudflared picks up `~/.cloudflared/config.yml`
+  if one exists, inheriting that tunnel's ingress rules — including any trailing
+  `http_status:404` catch-all, which makes every request 404 for no visible reason.
+- **`ALLOWED_ORIGINS` must match the public hostname**, or the server's own CSWSH
+  check refuses the WebSocket upgrade and the board never loads. A quick tunnel
+  gets a new hostname every restart, so this has to be updated each time.
+- **`TRUST_PROXY=1` is required behind a tunnel.** Otherwise every request appears
+  to come from `127.0.0.1` and the per-IP connection cap applies to all players at
+  once. It does mean a client that can reach the port directly can spoof
+  `X-Forwarded-For`; bind to `127.0.0.1` if that matters more than LAN access.
+- **Don't set `MemoryDenyWriteExecute=true`** in a systemd unit. V8 JITs, so the
+  process core-dumps with `SIGTRAP` on startup.
+
+`deploy/connect-four.service` runs the server as a systemd user service. It
+covers only the server — the tunnel is left to whatever you choose, so nothing
+is wired to a particular domain.
+
+Verifying a public URL: resolve it normally rather than pinning with
+`curl --resolve`. Pinning bypasses DNS, which is the part most likely to be
+broken, and makes a dead link look healthy.
 
 ### Behind a proxy
 
