@@ -143,9 +143,36 @@ Four things that cost real time when they go wrong:
 - **Don't set `MemoryDenyWriteExecute=true`** in a systemd unit. V8 JITs, so the
   process core-dumps with `SIGTRAP` on startup.
 
-`deploy/connect-four.service` runs the server as a systemd user service. It
-covers only the server — the tunnel is left to whatever you choose, so nothing
-is wired to a particular domain.
+### Running the tunnel as a service
+
+`deploy/quick-tunnel.sh` plus `deploy/connect-four-tunnel.service` supervise the
+quick tunnel and solve the hostname churn. The script starts cloudflared, waits
+for the hostname it is assigned, writes it to
+`~/.config/connect-four/origins.env`, and restarts the game server so its
+`ALLOWED_ORIGINS` matches. The server unit reads that file with
+`EnvironmentFile=-`, so it still starts for LAN play with no tunnel running.
+
+```bash
+systemctl --user enable --now connect-four-tunnel.service
+grep -o 'https://[^ ]*' ~/.config/connect-four/origins.env   # the public URL
+```
+
+Two more lessons, on top of the four above:
+
+- **Don't run the tunnel as a bare background process.** When the shell that
+  owned it died, the public URL went to `HTTP 530` with nothing to restart it.
+  Under systemd it is supervised and comes back.
+- **The hostname is announced slightly before it resolves.** Anything that
+  looks it up in that window caches an `NXDOMAIN` and then reports the URL as
+  dead long after it works — `getaddrinfo ENOTFOUND` against a tunnel that is
+  healthy. The script flushes the resolver cache after publishing; if you hit it
+  by hand, `resolvectl flush-caches`.
+
+Never `pkill cloudflared` to clean up. Other tunnels run on this kind of box,
+and killing them is someone else's outage — the script kills only its own child.
+
+`deploy/connect-four.service` runs the server itself. Nothing here is wired to a
+particular domain.
 
 Verifying a public URL: resolve it normally rather than pinning with
 `curl --resolve`. Pinning bypasses DNS, which is the part most likely to be

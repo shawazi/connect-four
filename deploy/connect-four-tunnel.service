@@ -1,0 +1,16 @@
+[Unit]
+Description=Cloudflare quick tunnel for Connect Four
+Documentation=file:///home/shawaz/code/connect-four/README.md
+After=connect-four.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/shawaz/code/connect-four/deploy/quick-tunnel.sh
+Restart=always
+RestartSec=5
+# A quick tunnel gets a new hostname on every start; the script publishes it to
+# origins.env and restarts the game server so its Origin allowlist matches.
+
+[Install]
+WantedBy=default.target
