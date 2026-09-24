@@ -17,7 +17,7 @@ set -uo pipefail
 
 ORIGIN_ENV="${ORIGIN_ENV:-$HOME/.config/connect-four/origins.env}"
 LOG="${TUNNEL_LOG:-$HOME/.cache/connect-four/tunnel.log}"
-TARGET="${TARGET:-http://127.0.0.1:3000}"
+TARGET="${TARGET:-http://127.0.0.1:3080}"
 
 mkdir -p "$(dirname "$ORIGIN_ENV")" "$(dirname "$LOG")"
 : > "$LOG"
